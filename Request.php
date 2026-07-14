@@ -5,20 +5,20 @@ namespace LaraGram\Request;
 use Closure;
 use LaraGram\Laraquest\Updates as UpdatesTrait;
 use LaraGram\Laraquest\Methode as MethodeTrait;
+use LaraGram\Listening\Contracts\ProvidesListenContext;
 use LaraGram\Listening\Type;
+use LaraGram\Request\Files\FileBag;
 use LaraGram\Support\Collection;
+use LaraGram\Support\Str;
 use LaraGram\Support\Traits\Conditionable;
 use LaraGram\Support\Traits\Macroable;
 use RuntimeException;
 
 /**
- * @mixin \LaraGram\Laraquest\Updates|\LaraGram\Laraquest\Methode
- *
- * @method array validate(array $rules, ...$params)
- * @method array validateWithBag(string $errorBag, array $rules, ...$params)
- * @method bool hasValidSignature(bool $absolute = true)
+ * @method \LaraGram\Request\ValidatedInput validate(array $rules, ...$params)
+ * @method \LaraGram\Request\ValidatedInput validateWithBag(string $errorBag, array $rules, ...$params)
  */
-class Request
+class Request implements ProvidesListenContext
 {
     use Conditionable, Macroable,
         InteractWithUpdate,
@@ -27,7 +27,36 @@ class Request
         InteractWithUpdate::getUpdateMessageSubType insteadof UpdatesTrait;
         InteractWithUpdate::scope insteadof UpdatesTrait;
         InteractWithUpdate::isReply insteadof UpdatesTrait;
+        MethodeTrait::endpoint as protected rawEndpoint;
     }
+
+    /**
+     * Whether anti-flood throttling is bypassed for the next API call.
+     *
+     * @var bool
+     */
+    protected $bypassAntiFlood = false;
+
+    /**
+     * Specific named anti-flood scope(s).
+     *
+     * @var string|null
+     */
+    protected $antiFloodScopes = null;
+
+    /**
+     * Whether the proxy pool is bypassed for the next API call.
+     *
+     * @var bool
+     */
+    protected $bypassProxy = false;
+
+    /**
+     * A specific proxy id to force for the next API call.
+     *
+     * @var string|null
+     */
+    protected $forcedProxy = null;
 
     /**
      * The user resolver callback.
@@ -67,18 +96,25 @@ class Request
     protected ?string $locale = null;
     protected string $defaultLocale = 'en';
 
+    /**
+     * Cached FileBag instance for the current update.
+     *
+     * @var FileBag|null
+     */
+    private ?FileBag $fileBag = null;
+
     public function __construct(array $request = [], array $server = [])
     {
-        $this->request = $request;
-        $this->server = $server;
+        $this->request = collect($request);
+        $this->server = collect($server);
     }
 
     /**
      * Creates a Request based on a given configuration.
      *
      *
-     * @param array                $server     The server parameters ($_SERVER)
-     * @param array                $content    The raw body data
+     * @param array $server The server parameters ($_SERVER)
+     * @param array $content The raw body data
      *
      */
     public static function create(array $content = [], array $server = []): static
@@ -118,7 +154,7 @@ class Request
 
         if (isset($components['port'])) {
             $server['SERVER_PORT'] = $components['port'];
-            $server['HTTP_HOST'] .= ':'.$components['port'];
+            $server['HTTP_HOST'] .= ':' . $components['port'];
         }
 
         if (isset($components['user'])) {
@@ -130,6 +166,16 @@ class Request
         }
 
         return new static($content, $server);
+    }
+
+    /**
+     * Get the server from the request.
+     *
+     * @return Collection
+     */
+    public function server()
+    {
+        return $this->server;
     }
 
     /**
@@ -150,7 +196,7 @@ class Request
     public static function capture()
     {
         global $argv;
-        return static::createFromBase($argv);
+        return static::createFromBase($argv ?? []);
     }
 
     /**
@@ -170,7 +216,7 @@ class Request
      */
     public function update()
     {
-        return json_decode($this->content);
+        return $this->getInputSource();
     }
 
     /**
@@ -180,15 +226,78 @@ class Request
      */
     public function method()
     {
-        if (($method = $this->checkIfMethodIsCommand())){
+        if (($method = $this->checkIfMethodIsCommand())) {
             return $method;
         }
 
-        if (($method = $this->checkIfMethodIsCallbackQuery())){
+        if (($method = $this->checkIfMethodIsCallbackQuery())) {
             return $method;
         }
 
-        return strtoupper(Type::findVerb($this->getUpdateType())->value);
+        if (($method = $this->checkIfMethodIsPollUpdate())) {
+            return $method;
+        }
+
+        return strtoupper(Type::findVerb($this->getUpdateType())?->value ?? '');
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function listenVerb(): string
+    {
+        return $this->method();
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function listenValue(string $verb): ?string
+    {
+        return match ($verb) {
+            'COMMAND' => ($t = text()) !== null ? Str::replaceFirst('/', '', $t) : null,
+            'REFERRAL' => ($t = text()) !== null ? Str::replaceFirst('/start ', '', $t) : null,
+            'CALLBACK_DATA' => callback_query()->data ?? null,
+            default => text()
+                ?? callback_query()->data
+                ?? inline_query()->query
+                ?? chosen_inline_result()->query
+                ?? null,
+        };
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * For the Bot-API the scope is the current bot connection, preserved exactly
+     * as the engine read it before (the multi-bot middleware sets it per update).
+     */
+    public function listenScope(): ?string
+    {
+        return static::getDefaultConnection();
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function entities(): array
+    {
+        return $this->message?->entities
+            ?? $this->message?->caption_entities
+            ?? [];
+    }
+
+    /**
+     * Check if the Update method is a top-level poll state update.
+     *
+     * @return false|string
+     */
+    protected function checkIfMethodIsPollUpdate()
+    {
+        if (isset($this->poll)) {
+            return 'UPDATE';
+        }
+        return false;
     }
 
     /**
@@ -223,6 +332,7 @@ class Request
     /**
      * Get the match method.
      *
+     * @param  string  $method
      * @return string
      */
     public function isMethod($method)
@@ -292,6 +402,134 @@ class Request
     }
 
     /**
+     * Get the entire update as a nested associative array.
+     *
+     * @param  array|string|null  $keys
+     * @return array
+     */
+    public function all($keys = null)
+    {
+        $input = $this->toArray();
+
+        if (! $keys) {
+            return $input;
+        }
+
+        $results = [];
+
+        foreach (is_array($keys) ? $keys : func_get_args() as $key) {
+            data_set($results, $key, data_get($input, $key));
+        }
+
+        return $results;
+    }
+
+    /**
+     * Retrieve an input item from the update using "dot" notation.
+     *
+     * @param  string|null  $key
+     * @param  mixed  $default
+     * @return mixed
+     */
+    public function input($key = null, $default = null)
+    {
+        if (is_null($key)) {
+            return $this->all();
+        }
+
+        return data_get($this->toArray(), $key, $default);
+    }
+
+    /**
+     * Determine if the update contains a given input item key.
+     *
+     * @param  string|array  $key
+     * @return bool
+     */
+    public function has($key)
+    {
+        $keys = is_array($key) ? $key : func_get_args();
+
+        $input = $this->toArray();
+
+        foreach ($keys as $value) {
+            if (! data_get($input, $value)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Determine if the update is missing a given input item key.
+     *
+     * @param  string|array  $key
+     * @return bool
+     */
+    public function missing($key)
+    {
+        $keys = is_array($key) ? $key : func_get_args();
+
+        return ! $this->has($keys);
+    }
+
+    /**
+     * Get a subset containing the provided keys from the update.
+     *
+     * @param  array|mixed  $keys
+     * @return array
+     */
+    public function only($keys)
+    {
+        $keys = is_array($keys) ? $keys : func_get_args();
+
+        $results = [];
+        $input = $this->toArray();
+
+        foreach ($keys as $key) {
+            data_set($results, $key, data_get($input, $key));
+        }
+
+        return $results;
+    }
+
+    /**
+     * Get all of the update input except for a specified array of items.
+     *
+     * @param  array|mixed  $keys
+     * @return array
+     */
+    public function except($keys)
+    {
+        $keys = is_array($keys) ? $keys : func_get_args();
+
+        $results = $this->toArray();
+
+        foreach ($keys as $key) {
+            data_set($results, $key, null);
+        }
+
+        return $results;
+    }
+
+    /**
+     * Normalize the current update to a nested associative array.
+     *
+     * @return array
+     */
+    public function toArray(): array
+    {
+        $source = $this->getInputSource();
+
+        if ($source === null) {
+            return [];
+        }
+
+        return json_decode(json_encode($source), true) ?? [];
+    }
+
+    /**
      * Create an LaraGram request from a Symfony instance.
      *
      * @param array $request
@@ -301,9 +539,9 @@ class Request
     {
         $newRequest = new static($request);
 
-        $newRequest->server = collect($request[2]);
+        $newRequest->server = collect(json_decode($request[2] ?? "{}"));
 
-        $newRequest->content = collect($request[1]);
+        $newRequest->content = collect(json_decode($request[1] ?? "{}"));
 
         return $newRequest;
     }
@@ -378,6 +616,80 @@ class Request
     }
 
     /**
+     * Determine whether the current update contains any media file.
+     *
+     * Checks for the presence of photo, video, document, sticker, audio,
+     * voice, video_note, animation, or live_photo in the message.
+     *
+     * @return bool
+     */
+    public function hasFile(): bool
+    {
+        $message = $this->message ?? null;
+
+        if ($message === null) {
+            return false;
+        }
+
+        return isset($message->photo)
+            || isset($message->video)
+            || isset($message->document)
+            || isset($message->sticker)
+            || isset($message->audio)
+            || isset($message->voice)
+            || isset($message->video_note)
+            || isset($message->animation)
+            || isset($message->live_photo)
+            || isset($message->paid_media);
+    }
+
+    /**
+     * Get the FileBag for the current update.
+     *
+     * @return FileBag|null
+     */
+    public function file(): ?FileBag
+    {
+        if ($this->fileBag !== null) {
+            return $this->fileBag;
+        }
+
+        $message = $this->message ?? null;
+
+        if ($message === null) {
+            return null;
+        }
+
+        $cfg = $this->resolveConfig();
+        $token = $this->resolveToken($this->resolveConnection());
+        $apiServer = $cfg['api_server'];
+
+        $bag = FileBag::fromMessage($message, $token, $apiServer);
+
+        if ($bag->isEmpty()) {
+            return null;
+        }
+
+        return $this->fileBag = $bag;
+    }
+
+    /**
+     * Build a FileBag from an arbitrary message-like object.
+     *
+     * @param  object  $message
+     * @return FileBag|null
+     */
+    public function fileFrom(object $message): ?FileBag
+    {
+        $cfg = $this->resolveConfig();
+        $token = $this->resolveToken($this->resolveConnection());
+
+        $bag = FileBag::fromMessage($message, $token, $cfg['api_server']);
+
+        return $bag->isEmpty() ? null : $bag;
+    }
+
+    /**
      * Get the user resolver callback.
      *
      * @return \Closure
@@ -428,12 +740,206 @@ class Request
     }
 
     /**
+     * Send the next API call without anti-flood throttling.
+     *
+     * @return $this
+     */
+    public function withoutAntiFlood(): static
+    {
+        $this->bypassAntiFlood = true;
+
+        return $this;
+    }
+
+    /**
+     * Apply specific named anti-flood scope(s) to the next API call instead of
+     * the automatic chat scope (the global scope still applies).
+     *
+     * @param  string  ...$scopes
+     * @return $this
+     */
+    public function antiFloodWith(string ...$scopes): static
+    {
+        $this->antiFloodScopes = $scopes;
+
+        return $this;
+    }
+
+    /**
+     * Send the next API call directly, bypassing the proxy pool.
+     *
+     * @return $this
+     */
+    public function withoutProxy(): static
+    {
+        $this->bypassProxy = true;
+
+        return $this;
+    }
+
+    /**
+     * Force a specific proxy (by id) for the next API call.
+     *
+     * @param  string  $id
+     * @return $this
+     */
+    public function withProxy(string $id): static
+    {
+        $this->forcedProxy = $id;
+
+        return $this;
+    }
+
+    /**
+     * Intercept every Telegram API call to apply smart anti-flood throttling,
+     * then delegate to the original Laraquest endpoint implementation.
+     *
+     * @param  string  $method
+     * @param  array   $params
+     * @return mixed
+     */
+    protected function endpoint(string $method, array $params): mixed
+    {
+        $bypass = $this->bypassAntiFlood;
+        $this->bypassAntiFlood = false;
+
+        $scopes = $this->antiFloodScopes ?? [];
+        $this->antiFloodScopes = null;
+
+        $proxyBypass = $this->bypassProxy;
+        $this->bypassProxy = false;
+
+        $forcedProxy = $this->forcedProxy;
+        $this->forcedProxy = null;
+
+        $antiFlood = $bypass ? null : $this->antiFlood();
+        $connection = null;
+
+        if ($antiFlood !== null) {
+            try {
+                $connection = $this->getConnection();
+                $antiFlood->gate($connection, $method, $params, $scopes);
+            } catch (\Throwable) {
+                $antiFlood = null;
+            }
+        }
+
+        $proxy = $proxyBypass ? null : $this->proxy();
+
+        $response = $proxy !== null
+            ? $this->sendThroughProxy($proxy, $method, $params, $forcedProxy)
+            : $this->rawEndpoint($method, $params);
+
+        if ($antiFlood !== null) {
+            try {
+                $antiFlood->report($connection, $method, $params, $response, $scopes);
+            } catch (\Throwable) {
+                // Reporting must never affect the response returned to the caller.
+            }
+        }
+
+        return $response;
+    }
+
+    /**
+     * Resolve the active anti-flood engine, or null when it is unavailable.
+     *
+     * @return \LaraGram\Request\AntiFlood\AntiFlood|null
+     */
+    private function antiFlood()
+    {
+        if (! function_exists('app')) {
+            return null;
+        }
+
+        try {
+            $app = app();
+
+            if (! $app->bound('antiflood')) {
+                return null;
+            }
+
+            $engine = $app->make('antiflood');
+
+            return $engine->enabled() ? $engine : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Resolve the active proxy manager, or null when it is unavailable/disabled.
+     *
+     * @return \LaraGram\Request\Proxy\ProxyManager|null
+     */
+    private function proxy()
+    {
+        if (! function_exists('app')) {
+            return null;
+        }
+
+        try {
+            $app = app();
+
+            if (! $app->bound('proxy')) {
+                return null;
+            }
+
+            $manager = $app->make('proxy');
+
+            return $manager->enabled() ? $manager : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Route a Telegram API call through the proxy pool, mirroring the transport
+     * preparation that Laraquest's own endpoint performs.
+     *
+     * @param  \LaraGram\Request\Proxy\ProxyManager  $proxy
+     * @param  string       $method
+     * @param  array        $params
+     * @param  string|null  $forced  A specific proxy id to force for this call.
+     * @return mixed
+     */
+    private function sendThroughProxy($proxy, string $method, array $params, ?string $forced)
+    {
+        $original = $params;
+
+        try {
+            $connection = $this->resolveConnection();
+            $mode = $this->resolveMode();
+
+            $this->perCallConnection = null;
+            $this->perCallMode = null;
+
+            $params = $this->applyDefaultParameters($method, $params);
+            $params = array_filter($params, fn ($v) => $v !== null);
+
+            foreach ($params as $key => $value) {
+                if (is_object($value) || is_array($value)) {
+                    $params[$key] = json_encode($value);
+                }
+            }
+
+            $token = $this->resolveToken($connection);
+            $apiServer = $this->resolveConfig()['api_server'];
+            $noResponse = $mode === \LaraGram\Laraquest\Mode::NO_RESPONSE_CURL->value;
+
+            return $proxy->dispatch($token, $apiServer, $method, $params, $noResponse, $forced);
+        } catch (\Throwable) {
+            return $this->rawEndpoint($method, $original);
+        }
+    }
+
+    /**
      * Check if an input element is set on the request.
      *
      * @param string $key
      * @return bool
      */
-    public function __isset($key)
+    public function __isset($key): bool
     {
         return !is_null($this->__get($key));
     }
@@ -446,6 +952,6 @@ class Request
      */
     public function __get($name)
     {
-        return json_decode($this->update()[0])->{$name} ?? null;
+        return $this?->update()?->get($name);
     }
 }
