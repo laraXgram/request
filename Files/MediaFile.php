@@ -2,11 +2,23 @@
 
 namespace LaraGram\Request\Files;
 
+use LaraGram\Image\Image;
+use LaraGram\Image\ImageException;
 use LaraGram\Support\Facades\Storage;
 use RuntimeException;
 
 class MediaFile
 {
+    /**
+     * Seconds to wait for getFile; a local Bot API server downloads the file before it answers.
+     */
+    private const GET_FILE_TIMEOUT = 120;
+
+    /**
+     * Seconds to wait for a file download from the Bot API server.
+     */
+    private const DOWNLOAD_TIMEOUT = 300;
+
     /**
      * Cached file path retrieved from Telegram's getFile API.
      *
@@ -204,7 +216,7 @@ class MediaFile
      */
     public function largest(): static
     {
-        return !empty($this->siblings) ? end($this->siblings) : $this;
+        return !empty($this->siblings) ? $this->siblings[array_key_last($this->siblings)] : $this;
     }
 
     /**
@@ -332,7 +344,7 @@ class MediaFile
     {
         $filePath = $this->resolveFilePath();
 
-        if ($this->isLocalServer()) {
+        if ($this->isLocalServer() && str_starts_with($filePath, '/')) {
             return 'file://' . $filePath;
         }
 
@@ -350,14 +362,7 @@ class MediaFile
      */
     public function download(string $path, ?string $disk = null): bool
     {
-        $filePath = $this->resolveFilePath();
-
-        // Build fetch path directly to avoid a redundant resolveFilePath() call inside url()
-        $fetchPath = $this->isLocalServer()
-            ? $filePath
-            : rtrim($this->apiServer, '/') . '/file/bot' . $this->token . '/' . $filePath;
-
-        $content = file_get_contents($fetchPath);
+        $content = $this->contents();
 
         if ($content === false) {
             return false;
@@ -368,6 +373,37 @@ class MediaFile
         }
 
         return Storage::put($path, $content);
+    }
+
+    /**
+     * Create an image instance from the file contents.
+     *
+     * The file is downloaded lazily, when the image is first processed or read.
+     *
+     * @return \LaraGram\Image\Image
+     */
+    public function image(): Image
+    {
+        return new Image(
+            fn () => $this->contents() ?: throw new ImageException("Unable to download the image for file_id: {$this->fileId()}"),
+        );
+    }
+
+    /**
+     * Download the raw file contents from the Bot API server.
+     *
+     * @return string|false
+     *
+     * @throws RuntimeException
+     */
+    private function contents(): string|false
+    {
+        $filePath = $this->resolveFilePath();
+
+        // A local Bot API server (--local) answers with an absolute path on this machine.
+        return $this->isLocalServer() && str_starts_with($filePath, '/')
+            ? (is_readable($filePath) ? file_get_contents($filePath) : false)
+            : $this->fetch(rtrim($this->apiServer, '/') . '/file/bot' . $this->token . '/' . $filePath, self::DOWNLOAD_TIMEOUT);
     }
 
     /**
@@ -383,8 +419,9 @@ class MediaFile
             return $this->cachedFilePath;
         }
 
-        $response = file_get_contents(
-            rtrim($this->apiServer, '/') . '/bot' . $this->token . '/getFile?file_id=' . urlencode($this->fileId())
+        $response = $this->fetch(
+            rtrim($this->apiServer, '/') . '/bot' . $this->token . '/getFile?file_id=' . urlencode($this->fileId()),
+            self::GET_FILE_TIMEOUT
         );
 
         if ($response === false) {
@@ -400,6 +437,31 @@ class MediaFile
         $this->cachedFilePath = $data['result']['file_path'];
 
         return $this->cachedFilePath;
+    }
+
+    /**
+     * Fetch a URL with bounded timeouts, so a stalled connection cannot hang the caller.
+     *
+     * @param string $url
+     * @param int $timeout
+     * @return string|false
+     */
+    private function fetch(string $url, int $timeout): string|false
+    {
+        $curl = curl_init($url);
+
+        curl_setopt_array($curl, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT => $timeout,
+        ]);
+
+        $body = curl_exec($curl);
+        $status = curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+
+        // getFile answers errors with a JSON body, which resolveFilePath() reports.
+        return is_string($body) && ($status < 400 || str_contains($url, '/getFile?')) ? $body : false;
     }
 
     /**

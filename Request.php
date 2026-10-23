@@ -3,8 +3,12 @@
 namespace LaraGram\Request;
 
 use Closure;
+use LaraGram\Image\Image;
+use LaraGram\Laraquest\ConnectionRegistry;
 use LaraGram\Laraquest\Updates as UpdatesTrait;
+use LaraGram\Laraquest\Exceptions\TelegramApiException;
 use LaraGram\Laraquest\Methode as MethodeTrait;
+use LaraGram\Laraquest\Response as LaraquestResponse;
 use LaraGram\Listening\Contracts\ProvidesListenContext;
 use LaraGram\Listening\Type;
 use LaraGram\Request\Files\FileBag;
@@ -57,6 +61,13 @@ class Request implements ProvidesListenContext
      * @var string|null
      */
     protected $forcedProxy = null;
+
+    /**
+     * The callback that intercepts every Telegram API call instead of sending it.
+     *
+     * @var (\Closure(string, array, string|null, static): mixed)|null
+     */
+    protected static $interceptor = null;
 
     /**
      * The user resolver callback.
@@ -269,12 +280,58 @@ class Request implements ProvidesListenContext
     /**
      * {@inheritdoc}
      *
-     * For the Bot-API the scope is the current bot connection, preserved exactly
-     * as the engine read it before (the multi-bot middleware sets it per update).
+     * For the Bot-API the scope is the bot connection handling this update,
+     * which the kernel binds to the request before any listen is matched.
      */
     public function listenScope(): ?string
     {
-        return static::getDefaultConnection();
+        return $this->botConnection();
+    }
+
+    /**
+     * Get the name of the bot connection handling this update.
+     *
+     * @return string|null
+     */
+    public function botConnection(): ?string
+    {
+        if (($connection = $this->getBoundConnection()) !== null) {
+            return $connection;
+        }
+
+        $default = ConnectionRegistry::getDefaultConnection();
+
+        return $default === null || $default === '' || $default === 'auto' ? null : $default;
+    }
+
+    /**
+     * Get the default connection, preferring the one bound to the current update.
+     *
+     * The connection of an update lives on its own request instance instead of
+     * shared static state, so concurrent or consecutive updates of different
+     * bots in one process never see each other's connection.
+     *
+     * @return string|null
+     */
+    public static function getDefaultConnection(): ?string
+    {
+        return static::current()?->getBoundConnection() ?? ConnectionRegistry::getDefaultConnection();
+    }
+
+    /**
+     * Get the request of the update being handled, if any.
+     *
+     * @return static|null
+     */
+    protected static function current(): ?self
+    {
+        try {
+            $request = function_exists('app') && app()->bound('request') ? app('request') : null;
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return $request instanceof self ? $request : null;
     }
 
     /**
@@ -611,7 +668,7 @@ class Request implements ProvidesListenContext
 
         return sha1(implode('|', array_merge(
             $listen->methods(),
-            [$listen->pattern(), user()->id]
+            [$listen->pattern(), $this->botConnection(), sender()?->id ?? chat()?->id]
         )));
     }
 
@@ -687,6 +744,24 @@ class Request implements ProvidesListenContext
         $bag = FileBag::fromMessage($message, $token, $cfg['api_server']);
 
         return $bag->isEmpty() ? null : $bag;
+    }
+
+    /**
+     * Retrieve the image attached to the current update as an image instance.
+     *
+     * Photos resolve to their largest size; documents are accepted when they have an image MIME type.
+     *
+     * @return \LaraGram\Image\Image|null
+     */
+    public function image(): ?Image
+    {
+        $file = $this->file()?->last();
+
+        if (is_null($file) || (! $file->isPhoto() && ! str_starts_with((string) $file->mimeType(), 'image/'))) {
+            return null;
+        }
+
+        return $file->image();
     }
 
     /**
@@ -791,15 +866,194 @@ class Request implements ProvidesListenContext
     }
 
     /**
-     * Intercept every Telegram API call to apply smart anti-flood throttling,
-     * then delegate to the original Laraquest endpoint implementation.
+     * Call any Telegram API method by name.
      *
      * @param  string  $method
      * @param  array   $params
      * @return mixed
      */
+    public function call(string $method, array $params = []): mixed
+    {
+        return $this->endpoint($method, $params);
+    }
+
+    /**
+     * Intercept every Telegram API call with the given callback instead of sending it.
+     *
+     * @param  (callable(string, array, string|null, static): mixed)|null  $callback
+     * @return void
+     */
+    public static function interceptUsing(?callable $callback): void
+    {
+        static::$interceptor = $callback === null ? null : Closure::fromCallable($callback);
+    }
+
+    /**
+     * Run the callback and record the Telegram API calls it makes instead of sending them.
+     *
+     * Each recorded call receives a successful response, so code that inspects
+     * the result keeps working. The previous interceptor is restored afterwards.
+     *
+     * @param  callable  $callback
+     * @return array<int, array{method: string, parameters: array, connection: string|null}>
+     */
+    public static function recordCalls(callable $callback): array
+    {
+        $calls = [];
+        $previous = static::$interceptor;
+
+        static::$interceptor = function (string $method, array $parameters, ?string $connection) use (&$calls) {
+            $calls[] = ['method' => $method, 'parameters' => $parameters, 'connection' => $connection];
+
+            return ['ok' => true, 'result' => true];
+        };
+
+        try {
+            $callback();
+        } finally {
+            static::$interceptor = $previous;
+        }
+
+        return $calls;
+    }
+
+    /**
+     * Determine if Telegram API calls are currently being intercepted.
+     *
+     * @return bool
+     */
+    public static function isIntercepting(): bool
+    {
+        return static::$interceptor !== null;
+    }
+
+    /**
+     * Hand the API call to the interceptor, resetting all per-call state.
+     *
+     * @param  string  $method
+     * @param  array   $params
+     * @return mixed
+     */
+    protected function sendToInterceptor(string $method, array $params): mixed
+    {
+        try {
+            $connection = $this->resolveConnection();
+        } catch (\Throwable) {
+            $connection = null;
+        }
+
+        $this->bypassAntiFlood = false;
+        $this->antiFloodScopes = null;
+        $this->bypassProxy = false;
+        $this->forcedProxy = null;
+        $this->perCallConnection = null;
+        $this->perCallMode = null;
+
+        return (static::$interceptor)(
+            $method,
+            array_filter($params, fn ($value) => $value !== null),
+            $connection,
+            $this
+        );
+    }
+
+    /**
+     * Send a Telegram API call, announcing it with the ApiCallSending and
+     * ApiCallCompleted events when anything listens for them.
+     *
+     * @param  string  $method
+     * @param  array   $params
+     * @return \LaraGram\Laraquest\Response|array
+     *
+     * @throws \LaraGram\Laraquest\Exceptions\TelegramApiException
+     */
     protected function endpoint(string $method, array $params): mixed
     {
+        $events = $this->apiCallEvents();
+
+        if ($events === null) {
+            return $this->sendApiCall($method, $params);
+        }
+
+        $intercepted = static::$interceptor !== null;
+
+        try {
+            $connection = $this->resolveConnection();
+        } catch (\Throwable) {
+            $connection = null;
+        }
+
+        $parameters = array_filter($params, fn ($value) => $value !== null);
+
+        $events->dispatch(new Events\ApiCallSending($method, $parameters, $connection, $intercepted));
+
+        $startedAt = hrtime(true);
+
+        try {
+            $response = $this->sendApiCall($method, $params);
+        } catch (\Throwable $e) {
+            $events->dispatch(new Events\ApiCallCompleted(
+                $method, $parameters, $connection,
+                $e instanceof TelegramApiException ? $e->response() : null,
+                (hrtime(true) - $startedAt) / 1e6, $e, $intercepted
+            ));
+
+            throw $e;
+        }
+
+        $events->dispatch(new Events\ApiCallCompleted(
+            $method, $parameters, $connection, $response,
+            (hrtime(true) - $startedAt) / 1e6, null, $intercepted
+        ));
+
+        return $response;
+    }
+
+    /**
+     * Resolve the event dispatcher when something listens for API calls.
+     *
+     * @return \LaraGram\Contracts\Events\Dispatcher|null
+     */
+    private function apiCallEvents()
+    {
+        if (! function_exists('app')) {
+            return null;
+        }
+
+        try {
+            $app = app();
+
+            if (! $app->bound('events')) {
+                return null;
+            }
+
+            $events = $app->make('events');
+
+            return $events->hasListeners(Events\ApiCallSending::class)
+                || $events->hasListeners(Events\ApiCallCompleted::class)
+                    ? $events
+                    : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Intercept every Telegram API call to apply smart anti-flood throttling,
+     * then delegate to the original Laraquest endpoint implementation.
+     *
+     * @param  string  $method
+     * @param  array   $params
+     * @return \LaraGram\Laraquest\Response|array
+     *
+     * @throws \LaraGram\Laraquest\Exceptions\TelegramApiException
+     */
+    protected function sendApiCall(string $method, array $params): mixed
+    {
+        if (static::$interceptor !== null) {
+            return $this->normalizeResponse($this->sendToInterceptor($method, $params), $method, $params);
+        }
+
         $bypass = $this->bypassAntiFlood;
         $this->bypassAntiFlood = false;
 
@@ -826,19 +1080,74 @@ class Request implements ProvidesListenContext
 
         $proxy = $proxyBypass ? null : $this->proxy();
 
-        $response = $proxy !== null
-            ? $this->sendThroughProxy($proxy, $method, $params, $forcedProxy)
-            : $this->rawEndpoint($method, $params);
+        try {
+            $response = $proxy !== null
+                ? $this->sendThroughProxy($proxy, $method, $params, $forcedProxy)
+                : $this->rawEndpoint($method, $params);
+        } catch (TelegramApiException $e) {
+            $this->report($antiFlood, $connection, $method, $params, $e->response(), $scopes);
 
-        if ($antiFlood !== null) {
-            try {
-                $antiFlood->report($connection, $method, $params, $response, $scopes);
-            } catch (\Throwable) {
-                // Reporting must never affect the response returned to the caller.
-            }
+            throw $e;
         }
 
+        $response = $this->normalizeResponse($response, $method, $params);
+
+        $this->report($antiFlood, $connection, $method, $params, $response, $scopes);
+
         return $response;
+    }
+
+    /**
+     * Hand a response to the anti-flood engine, if one is active.
+     *
+     * @param  \LaraGram\Request\AntiFlood\AntiFlood|null  $antiFlood
+     * @param  string|null  $connection
+     * @param  string  $method
+     * @param  array  $params
+     * @param  mixed  $response
+     * @param  array  $scopes
+     * @return void
+     */
+    private function report($antiFlood, $connection, string $method, array $params, mixed $response, array $scopes): void
+    {
+        if ($antiFlood === null) {
+            return;
+        }
+
+        try {
+            $antiFlood->report($connection, $method, $params, $response, $scopes);
+        } catch (\Throwable) {
+            // Reporting must never affect the response returned to the caller.
+        }
+    }
+
+    /**
+     * Shape whatever a transport returned like a Bot API response.
+     *
+     * @param  mixed  $response
+     * @param  string  $method
+     * @param  array  $params
+     * @return \LaraGram\Laraquest\Response|array
+     */
+    private function normalizeResponse(mixed $response, string $method = '', array $params = []): mixed
+    {
+        if (class_exists(LaraquestResponse::class)) {
+            return LaraquestResponse::make($response, $method, $params);
+        }
+
+        if (is_array($response)) {
+            return $response;
+        }
+
+        if (is_object($response)) {
+            return (array) json_decode(json_encode($response), true);
+        }
+
+        if (is_string($response) && ($decoded = json_decode($response, true)) !== null) {
+            return is_array($decoded) ? $decoded : ['ok' => true, 'result' => $decoded];
+        }
+
+        return ['ok' => true, 'result' => $response === null ? true : $response];
     }
 
     /**
